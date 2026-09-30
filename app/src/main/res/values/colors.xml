@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Jed tile fill. -->
+    <color name="launcher_fill">#1E3A2F</color>
+</resources>
