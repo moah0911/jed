@@ -22,8 +22,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val repo = NoteRepository(this)
         setContent {
-            JedTheme {
-                val vm: JedViewModel = viewModel(factory = JedViewModelFactory(repo, this))
+            val vm: JedViewModel = viewModel(factory = JedViewModelFactory(repo, this))
+            JedTheme(theme = vm.theme) {
                 // Files are shared ground (file managers, git, attached
                 // folders): re-read on return, the focus-refresh belt.
                 val owner = LocalLifecycleOwner.current

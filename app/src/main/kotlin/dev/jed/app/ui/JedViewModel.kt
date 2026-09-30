@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.TextRange
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -43,7 +44,19 @@ sealed interface Screen {
     data object Templates : Screen
 }
 
+/**
+ * One editable run of the open note: prose lines, or one fence's code lines.
+ * Uids are stable across keystrokes; only a fence-structure change reassigns
+ * them, carrying run panels along by (language, code) match.
+ */
+data class SegState(val uid: Long, val fenceLang: String?, val fenceUnclosed: Boolean, val lines: List<String>) {
+    val isFence: Boolean get() = fenceLang != null
+    val text: String get() = lines.joinToString("\n")
+}
+
 class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewModel() {
+
+    private val prefs = app.getSharedPreferences("jed-ui", Context.MODE_PRIVATE)
 
     var screen: Screen by mutableStateOf(Screen.Notes)
         private set
@@ -67,8 +80,13 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
     var hits: List<NoteMeta>? by mutableStateOf(null)
         private set
 
+    var theme: String by mutableStateOf(prefs.getString("theme", "dark") ?: "dark")
+        private set
+
     // Editor state for the open note.
-    var text: String by mutableStateOf("")
+    var segments: List<SegState> by mutableStateOf(emptyList())
+        private set
+    var openFolder: String by mutableStateOf("")
         private set
     var savedText: String by mutableStateOf("")
         private set
@@ -79,18 +97,35 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
     var conflictNotice: String? by mutableStateOf(null)
         private set
 
-    var runs: Map<Int, RunPanel> by mutableStateOf(emptyMap())
+    /** Which segment holds the caret, for the accessory bar. */
+    var focusedUid: Long? by mutableStateOf(null)
         private set
-    var runInput: Map<Int, String> by mutableStateOf(emptyMap())
+    var focusedSel: TextRange? by mutableStateOf(null)
+        private set
+
+    var runs: Map<Long, RunPanel> by mutableStateOf(emptyMap())
+        private set
+    var runInput: Map<Long, String> by mutableStateOf(emptyMap())
 
     private val sessions = mutableMapOf<String, RunSession>()
-    private var runJobs = mapOf<Int, Job>()
+    private var runJobs = mapOf<Long, Job>()
+    private var nextUid = 1L
 
     init {
         refresh()
     }
 
-    val dirty: Boolean get() = text != savedText
+    val fullText: String get() = NoteFiles.buildText(segments.map { NoteFiles.Segment(blockOf(it), it.lines) })
+    val dirty: Boolean get() = fullText != savedText
+    val anyRunning: Boolean get() = runs.values.any { it.running }
+
+    private fun blockOf(s: SegState): NoteFiles.CodeBlock? =
+        s.fenceLang?.let { NoteFiles.CodeBlock(it, s.text, -1, -1, -1, if (s.fenceUnclosed) null else -1) }
+
+    fun updateTheme(t: String) {
+        theme = t
+        prefs.edit().putString("theme", t).apply()
+    }
 
     fun refresh() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -112,27 +147,134 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
                     val f = folder
                     val list = ns
                     viewModelScope.launch(Dispatchers.IO) {
-                        val all = list.filter { NoteFiles.inFolder(it, f) }
-                        val bodies = all.associate { it.id to (repo.read(it.id).orEmpty()) }
-                        val found = NoteFiles.search(all, bodies, q)
+                        val scoped = list.filter { NoteFiles.inFolder(it, f) }
+                        val bodies = scoped.associate { it.id to (repo.read(it.id).orEmpty()) }
+                        val found = NoteFiles.search(scoped, bodies, q)
                         withContext(Dispatchers.Main) { hits = found }
                     }
                 } else {
                     hits = null
                 }
-                if (screen is Screen.Editor) {
+                if (screen is Screen.Editor && !dirty) {
                     // Follow clean external edits; hold dirty buffers for save.
                     val id = (screen as Screen.Editor).id
-                    if (!dirty) {
-                        repo.read(id)?.let {
-                            text = it
-                            savedText = it
-                            baseMtime = repo.mtime(id)
-                        }
+                    repo.read(id)?.let {
+                        loadText(it, repo.mtime(id))
                     }
                 }
             }
         }
+    }
+
+    // --- text / segments -------------------------------------------------------
+
+    private fun freshSegments(text: String): List<SegState> =
+        NoteFiles.segmentize(text).map { s ->
+            SegState(nextUid++, s.fence?.lang, s.fence?.unclosed == true, s.lines)
+        }
+
+    private fun loadText(text: String, mtime: Long) {
+        savedText = text
+        baseMtime = mtime
+        segments = freshSegments(text)
+        runs = emptyMap()
+        runInput = emptyMap()
+    }
+
+    /** Patch one segment's lines; resegment only on fence-structure change. */
+    fun editSeg(uid: Long, newText: String) {
+        val idx = segments.indexOfFirst { it.uid == uid }
+        if (idx < 0) return
+        val seg = segments[idx]
+        val updated = segments.toMutableList()
+        updated[idx] = seg.copy(lines = newText.split("\n"))
+        segments = updated
+        if (structureChanged()) resegment()
+    }
+
+    private fun structureChanged(): Boolean {
+        val sig = NoteFiles.parseFences(fullText).map { Triple(it.startLine, it.lang, it.unclosed) }
+        var at = 0
+        val cur = mutableListOf<Triple<Int, String, Boolean>>()
+        for (s in segments) {
+            if (s.isFence) {
+                cur += Triple(at, s.fenceLang ?: "", s.fenceUnclosed)
+                at += s.lines.size + if (s.fenceUnclosed) 1 else 2
+            } else {
+                at += s.lines.size
+            }
+        }
+        return sig != cur
+    }
+
+    /** Rebuild segments, keeping uids and run panels where content matches.
+     * A structural edit cancels live runs: the code a run was started with
+     * no longer exists as written. */
+    private fun resegment() {
+        for ((_, job) in runJobs) job.cancel()
+        runJobs = emptyMap()
+        val oldRuns = runs
+        val oldSegs = segments
+        val newSegs = freshSegments(fullText)
+        // Match fences by (language, code):Typing around a run keeps its panel.
+        val carried = mutableMapOf<Long, RunPanel>()
+        val carriedInput = mutableMapOf<Long, String>()
+        val used = HashSet<Long>()
+        for (n in newSegs) {
+            if (!n.isFence) continue
+            val o = oldSegs.firstOrNull { it.isFence && it.uid !in used && it.fenceLang == n.fenceLang && it.text == n.text }
+            if (o != null) {
+                used += o.uid
+                oldRuns[o.uid]?.let { panel ->
+                    carried[n.uid] = if (panel.running) panel.copy(running = false, note = "Edited while running.") else panel
+                }
+                runInput[o.uid]?.let { carriedInput[n.uid] = it }
+            }
+        }
+        runs = carried
+        runInput = carriedInput
+        segments = newSegs
+    }
+
+    fun noteFocus(uid: Long) {
+        focusedUid = uid
+    }
+
+    fun noteSelection(sel: TextRange) {
+        focusedSel = sel
+    }
+
+    // Accessory-bar edits act on the focused segment, else the last prose one.
+    private fun targetSeg(): SegState =
+        segments.firstOrNull { it.uid == focusedUid && !it.isFence }
+            ?: segments.lastOrNull { !it.isFence }
+            ?: SegState(nextUid++, null, false, emptyList()).also { segments = segments + it }
+
+    fun insertText(s: String, sel: TextRange? = null) {
+        val t = targetSeg()
+        val cur = t.text
+        val (a, b) = sel?.let { minOf(it.start, it.end) to maxOf(it.start, it.end) } ?: (cur.length to cur.length)
+        val safeA = a.coerceIn(0, cur.length)
+        val safeB = b.coerceIn(0, cur.length)
+        editSeg(t.uid, cur.substring(0, safeA) + s + cur.substring(safeB))
+    }
+
+    fun wrapSelection(before: String, after: String, sel: TextRange? = null) {
+        val t = targetSeg()
+        val cur = t.text
+        val (a, b) = sel?.let { minOf(it.start, it.end) to maxOf(it.start, it.end) } ?: (cur.length to cur.length)
+        val safeA = a.coerceIn(0, cur.length)
+        val safeB = b.coerceIn(0, cur.length)
+        val inner = cur.substring(safeA, safeB).ifEmpty { "text" }
+        editSeg(t.uid, cur.substring(0, safeA) + before + inner + after + cur.substring(safeB))
+    }
+
+    fun insertFence() {
+        val t = targetSeg()
+        val cur = t.text
+        val at = cur.length
+        val insert = "\n```sh\n\n```\n"
+        editSeg(t.uid, cur.substring(0, at) + insert + cur.substring(at))
     }
 
     // --- navigation ----------------------------------------------------------
@@ -160,14 +302,14 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
         viewModelScope.launch(Dispatchers.IO) {
             val body = repo.read(id).orEmpty()
             val m = repo.mtime(id)
+            val folderOf = if ('/' in id) id.substringBeforeLast('/') else ""
             withContext(Dispatchers.Main) {
-                text = body
-                savedText = body
-                baseMtime = m
+                openFolder = folderOf
                 preview = false
                 status = ""
                 conflictNotice = null
-                runs = emptyMap()
+                focusedUid = null
+                loadText(body, m)
                 screen = Screen.Editor(id)
             }
         }
@@ -183,19 +325,16 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
 
     // --- editing -------------------------------------------------------------
 
-    fun edit(next: String) {
-        text = next
-    }
-
     fun save() {
         val s = screen as? Screen.Editor ?: return
+        val body = fullText
         viewModelScope.launch(Dispatchers.IO) {
-            val r = repo.save(s.id, text, baseMtime)
+            val r = repo.save(s.id, body, baseMtime)
             val m = repo.mtime(s.id)
             withContext(Dispatchers.Main) {
                 when (r) {
                     is NoteRepository.SaveResult.Saved -> {
-                        savedText = text
+                        savedText = body
                         baseMtime = m
                         status = "Saved."
                     }
@@ -229,6 +368,13 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
             withContext(Dispatchers.Main) {
                 if (ok) openList() else status = "Could not delete the note."
             }
+        }
+    }
+
+    fun deleteNote(id: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repo.delete(id)
+            withContext(Dispatchers.Main) { refresh() }
         }
     }
 
@@ -325,15 +471,81 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
         }
     }
 
+    // --- images --------------------------------------------------------------
+
+    /**
+     * Insert a picked picture: bytes go to this root's `.jed-assets/` pool
+     * (re-encoded here so EXIF, and the location in it, stays on the phone),
+     * the note keeps only a relative reference.
+     */
+    fun insertPickedImage(uri: Uri) {
+        val s = screen as? Screen.Editor ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val raw = runCatching {
+                app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            }.getOrNull()
+            if (raw == null) {
+                withContext(Dispatchers.Main) { status = "The picture could not be read." }
+                return@launch
+            }
+            val isPng = raw.size > 4 && raw[0] == 0x89.toByte() && raw[1] == 0x50.toByte() && raw[2] == 0x4E.toByte() && raw[3] == 0x47.toByte()
+            val bytes = if (isPng) {
+                raw
+            } else {
+                val bmp = runCatching {
+                    android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.size, android.graphics.BitmapFactory.Options().apply {
+                        inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+                    })
+                }.getOrNull() ?: run {
+                    withContext(Dispatchers.Main) { status = "That file is not a picture Jed can use." }
+                    return@launch
+                }
+                val out = java.io.ByteArrayOutputStream()
+                if (!bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)) {
+                    withContext(Dispatchers.Main) { status = "The picture could not be stored." }
+                    return@launch
+                }
+                out.toByteArray()
+            }
+            insertImage(bytes, isPng)
+        }
+    }
+    fun insertImage(bytes: ByteArray, mimePng: Boolean) {
+        val s = screen as? Screen.Editor ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ws = repo.selected()
+            val backend = repo.backend(ws)
+            val data = bytes
+            val ext = if (mimePng) ".png" else ".jpg"
+            val taken = backend.listEntries().map { it.id.substringAfterLast('/') }.toSet()
+            var name = "img${System.currentTimeMillis()}$ext"
+            var n = 1
+            while (name.lowercase() in taken.map { it.lowercase() }) {
+                name = "img${System.currentTimeMillis()}-$n$ext"
+                n += 1
+            }
+            val stored = backend.createBytes(NoteFiles.ASSETS_DIR, name, if (mimePng) "image/png" else "image/jpeg", data)
+            withContext(Dispatchers.Main) {
+                if (stored == null) {
+                    status = "The picture could not be stored."
+                    return@withContext
+                }
+                val depth = if (openFolder.isEmpty()) 0 else openFolder.split("/").size
+                val ref = "${"../".repeat(depth)}${NoteFiles.ASSETS_DIR}/$name"
+                insertText("![]($ref)")
+                status = "Picture inserted."
+            }
+        }
+    }
+
     // --- runs ----------------------------------------------------------------
 
     private fun runEnv(): Triple<File, Map<String, String>, String> {
         val ws = workspace
-        val (fm, _) = NoteFiles.splitFrontmatter(text)
+        val (fm, _) = NoteFiles.splitFrontmatter(fullText)
         val env = HashMap<String, String>()
         if (fm.profile.isNotEmpty()) env += repo.loadProfile(fm.profile)
         env += fm.env
-        // cwd stays inside a local workspace; SAF notes run in private scratch.
         if (ws != null && !ws.saf && fm.cwd.isNotEmpty()) {
             val root = File(ws.ref).canonicalFile
             val dir = File(root, fm.cwd).canonicalFile
@@ -346,20 +558,23 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
         return Triple(base, env, "")
     }
 
-    fun runBlock(index: Int) {
+    fun runBlock(uid: Long) {
         val s = screen as? Screen.Editor ?: return
-        val blocks = NoteFiles.parseFences(text)
-        val block = blocks.getOrNull(index) ?: return
-        val kind = NoteFiles.runnerFor(block.lang) ?: return
-        runJobs[index]?.cancel()
-        runs = runs + (index to RunPanel(running = true))
+        val seg = segments.firstOrNull { it.uid == uid && it.isFence } ?: return
+        val kind = NoteFiles.runnerFor(seg.fenceLang ?: "") ?: return
+        // The card edits the same text the run reads: persist first.
+        if (dirty) save()
+        runJobs[uid]?.cancel()
+        runs = runs + (uid to RunPanel(running = true))
         val (dir, env, warn) = runEnv()
         if (warn.isNotEmpty()) status = warn
-        val session = sessions.getOrPut(s.id) { RunSession(if (dir.isDirectory || dir.mkdirs()) dir else app.filesDir) }
+        dir.mkdirs()
+        val session = sessions.getOrPut(s.id) { RunSession(if (dir.isDirectory) dir else app.filesDir) }
+        val code = seg.text
         val job = viewModelScope.launch(Dispatchers.IO) {
             val flow = when (kind) {
-                NoteFiles.Runner.SHELL -> session.shell(dir.apply { mkdirs() }, env).run(block.code)
-                NoteFiles.Runner.PYTHON -> PythonRunner.run(block.code, dir.apply { mkdirs() }, env)
+                NoteFiles.Runner.SHELL -> session.shell(dir, env).run(code)
+                NoteFiles.Runner.PYTHON -> PythonRunner.run(code, dir, env)
             }
             val sb = StringBuilder()
             var exit: Int? = null
@@ -370,7 +585,7 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
                         is RunEvent.Chunk -> {
                             sb.append(e.text)
                             val snap = sb.toString()
-                            launch(Dispatchers.Main) { runs = runs + (index to RunPanel(snap, true)) }
+                            launch(Dispatchers.Main) { runs = runs + (uid to RunPanel(snap, true)) }
                         }
                         is RunEvent.Done -> {
                             exit = e.exit
@@ -383,46 +598,61 @@ class JedViewModel(val repo: NoteRepository, private val app: Context) : ViewMod
             }
             val out = sb.toString()
             withContext(Dispatchers.Main) {
-                runs = runs + (index to RunPanel(out, false, exit, note))
+                runs = runs + (uid to RunPanel(out, false, exit, note))
             }
         }
-        runJobs = runJobs + (index to job)
-        job.invokeOnCompletion { runJobs = runJobs - index }
+        runJobs = runJobs + (uid to job)
+        job.invokeOnCompletion { runJobs = runJobs - uid }
     }
 
-    fun setRunInput(index: Int, v: String) {
-        runInput = runInput + (index to v)
+    fun setRunInput(uid: Long, v: String) {
+        runInput = runInput + (uid to v)
     }
 
-    fun sendRunInput(index: Int) {
+    private fun runningUid(): Long? = runs.entries.firstOrNull { it.value.running }?.key
+
+    fun sendRunInput(uid: Long) {
         val s = screen as? Screen.Editor ?: return
-        val v = runInput[index].orEmpty()
+        val v = runInput[uid].orEmpty()
         if (v.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             val ok = sessions[s.id]?.sendInput(v + "\n") == true
             withContext(Dispatchers.Main) {
-                if (ok) runInput = runInput + (index to "")
+                if (ok) runInput = runInput + (uid to "")
                 else status = "No running block takes input right now."
             }
         }
     }
 
-    fun stopBlock(index: Int) {
+    /** A raw key for the focused run: ^C, ^D, esc, arrows. No newline. */
+    fun sendRunRaw(raw: String) {
         val s = screen as? Screen.Editor ?: return
-        runJobs[index]?.cancel()
+        val uid = runningUid() ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            sessions[s.id]?.interrupt()
-            sessions.remove(s.id)
+            val ok = sessions[s.id]?.sendInput(raw) == true
             withContext(Dispatchers.Main) {
-                val cur = runs[index]
-                runs = runs + (index to (cur?.copy(running = false, note = "Interrupted.") ?: RunPanel(note = "Interrupted.")))
+                if (!ok) status = "No running block takes input right now."
             }
         }
     }
 
-    fun clearBlock(index: Int) {
-        runJobs[index]?.cancel()
-        runs = runs - index
+    fun stopBlock(uid: Long) {
+        val s = screen as? Screen.Editor ?: return
+        runJobs[uid]?.cancel()
+        viewModelScope.launch(Dispatchers.IO) {
+            sessions[s.id]?.interrupt()
+            sessions.remove(s.id)
+            withContext(Dispatchers.Main) {
+                val cur = runs[uid]
+                runs = runs + (uid to (cur?.copy(running = false, note = "Interrupted.") ?: RunPanel(note = "Interrupted.")))
+            }
+        }
+    }
+
+    fun clearBlock(uid: Long) {
+        runJobs[uid]?.cancel()
+        runJobs = runJobs - uid
+        runs = runs - uid
     }
 
     private fun closeRuns() {

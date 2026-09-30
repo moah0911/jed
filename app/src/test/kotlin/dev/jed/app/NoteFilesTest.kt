@@ -54,9 +54,44 @@ class NoteFilesTest {
     fun runnerMapping() {
         assertEquals(NoteFiles.Runner.SHELL, NoteFiles.runnerFor("sh"))
         assertEquals(NoteFiles.Runner.SHELL, NoteFiles.runnerFor("Bash"))
+        assertEquals(NoteFiles.Runner.SHELL, NoteFiles.runnerFor("zsh"))
         assertEquals(NoteFiles.Runner.PYTHON, NoteFiles.runnerFor("py"))
+        assertEquals(NoteFiles.Runner.PYTHON, NoteFiles.runnerFor("py3"))
         assertNull(NoteFiles.runnerFor("node"))
         assertNull(NoteFiles.runnerFor("prompt"))
+    }
+
+    @Test
+    fun unclosedFenceCounts() {
+        val blocks = NoteFiles.parseFences("# t\n```sh\necho hi\n")
+        assertEquals(1, blocks.size)
+        assertEquals("sh", blocks[0].lang)
+        assertTrue(blocks[0].unclosed)
+    }
+
+    @Test
+    fun segmentsRoundTrip() {
+        val texts = listOf(
+            "",
+            "# Hi\n",
+            "# Hi\n\n```sh\necho hi\n```\nTail\n",
+            "```python\nprint(1)\n```",
+            "```sh\necho a\n\n",
+            "prose\n```zsh\nrun\n```\nmore\n```py3\nx\n```\n",
+        )
+        for (t in texts) {
+            assertEquals(t, NoteFiles.buildText(NoteFiles.segmentize(t)))
+        }
+    }
+
+    @Test
+    fun segmentizeFindsFencesInline() {
+        val segs = NoteFiles.segmentize("Top\n```sh\necho hi\n```\nBottom")
+        assertEquals(3, segs.size)
+        assertNull(segs[0].fence)
+        assertEquals("sh", segs[1].fence?.lang)
+        assertEquals("echo hi", segs[1].text)
+        assertNull(segs[2].fence)
     }
 
     @Test

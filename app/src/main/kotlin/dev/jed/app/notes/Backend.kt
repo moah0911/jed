@@ -22,6 +22,9 @@ interface NoteBackend {
     fun create(folder: String, filename: String, text: String): String?
     fun delete(id: String): Boolean
     fun mkdirs(folder: String): Boolean
+    /** Raw bytes for the `.jed-assets/` image pool. */
+    fun writeBytes(id: String, bytes: ByteArray): Boolean
+    fun createBytes(folder: String, filename: String, mime: String, bytes: ByteArray): String?
 }
 
 class FileBackend(private val root: File) : NoteBackend {
@@ -66,6 +69,19 @@ class FileBackend(private val root: File) : NoteBackend {
 
     override fun mkdirs(folder: String): Boolean =
         if (folder.isEmpty()) true else runCatching { File(root, folder).mkdirs() }.getOrDefault(false)
+
+    override fun writeBytes(id: String, bytes: ByteArray): Boolean = runCatching {
+        val dest = file(id)
+        dest.parentFile?.mkdirs()
+        dest.writeBytes(bytes)
+        true
+    }.getOrDefault(false)
+
+    override fun createBytes(folder: String, filename: String, mime: String, bytes: ByteArray): String? {
+        val id = if (folder.isEmpty()) filename else "$folder/$filename"
+        if (exists(id)) return null
+        return if (writeBytes(id, bytes)) id else null
+    }
 }
 
 class SafBackend(
@@ -143,4 +159,18 @@ class SafBackend(
     }.getOrDefault(false)
 
     override fun mkdirs(folder: String): Boolean = ensureDir(folder) != null
+
+    override fun writeBytes(id: String, bytes: ByteArray): Boolean = runCatching {
+        val d = doc(id)?.takeIf { it.isFile } ?: return false
+        resolver.openOutputStream(d.uri, "wt")?.use { it.write(bytes) }
+        true
+    }.getOrDefault(false)
+
+    override fun createBytes(folder: String, filename: String, mime: String, bytes: ByteArray): String? = runCatching {
+        val dir = ensureDir(folder) ?: return null
+        if (dir.findFile(filename)?.isFile == true) return null
+        val d = dir.createFile(mime, filename) ?: return null
+        resolver.openOutputStream(d.uri, "wt")?.use { it.write(bytes) }
+        if (folder.isEmpty()) filename else "$folder/$filename"
+    }.getOrNull()
 }

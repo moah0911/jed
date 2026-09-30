@@ -14,16 +14,33 @@ object NoteFiles {
     const val MAX_HITS = 200
 
     /** A fenced code block and where it sits in the note. */
-    data class CodeBlock(val lang: String, val code: String, val startLine: Int)
+    data class CodeBlock(
+        val lang: String,
+        val code: String,
+        val startLine: Int,
+        /** First code line, in document lines. */
+        val codeStart: Int = -1,
+        /** One past the last code line, in document lines. */
+        val codeEnd: Int = -1,
+        /** The closing fence's line, or null for an unclosed block. */
+        val closeLine: Int? = null,
+    ) {
+        val unclosed: Boolean get() = closeLine == null
+    }
 
     /** Which on-device interpreter runs a fence, or null for render-only. */
     enum class Runner { SHELL, PYTHON }
 
     fun runnerFor(lang: String): Runner? = when (lang.trim().lowercase()) {
-        "sh", "shell", "bash" -> Runner.SHELL
-        "python", "py" -> Runner.PYTHON
+        "sh", "shell", "bash", "zsh", "dash", "ksh" -> Runner.SHELL
+        "python", "py", "py3" -> Runner.PYTHON
         else -> null
     }
+
+    /** Short human reason a fence has no Run button. */
+    fun unrunnableNote(lang: String): String =
+        if (lang.isEmpty()) "A fenced block with no language cannot run."
+        else "Only sh and python blocks run on this device."
 
     /** Frontmatter parsed from a leading `---` block. */
     data class Frontmatter(
@@ -116,13 +133,15 @@ object NoteFiles {
         return Frontmatter(cwd, env, profile, tags, template) to body
     }
 
-    /** All fenced blocks in document order. */
+    /** All fenced blocks in document order. A trailing unclosed fence counts,
+     * so a half-typed block still offers Run instead of vanishing. */
     fun parseFences(text: String): List<CodeBlock> {
+        val lines = text.lines()
         val out = mutableListOf<CodeBlock>()
         var lang = ""
         var start = 0
         var buf: StringBuilder? = null
-        text.lines().forEachIndexed { i, line ->
+        lines.forEachIndexed { i, line ->
             val t = line.trimStart()
             if (t.startsWith("```")) {
                 if (buf == null) {
@@ -130,12 +149,15 @@ object NoteFiles {
                     start = i
                     buf = StringBuilder()
                 } else {
-                    out += CodeBlock(lang, buf.toString(), start)
+                    out += CodeBlock(lang, buf.toString(), start, start + 1, i, i)
                     buf = null
                 }
             } else {
                 buf?.appendLine(line)
             }
+        }
+        if (buf != null) {
+            out += CodeBlock(lang, buf.toString(), start, start + 1, lines.size, null)
         }
         return out
     }
@@ -197,6 +219,55 @@ object NoteFiles {
             return "A folder has no empty, dot or hidden segments."
         }
         return null
+    }
+
+    // --- inline segments ------------------------------------------------------
+    //
+    // The editor renders a note as prose runs interleaved with fence cards in
+    // document order, so Run sits where the code is instead of below a text
+    // box. Segments hold exact lines and round-trip through buildText.
+
+    /** One editable run: prose lines, or one fence's code lines. */
+    data class Segment(val fence: CodeBlock?, val lines: List<String>) {
+        val text: String get() = lines.joinToString("\n")
+    }
+
+    /** Split into prose/fence runs. A trailing prose run always exists. */
+    fun segmentize(text: String): List<Segment> {
+        val lines = text.lines()
+        val blocks = parseFences(text)
+        val out = mutableListOf<Segment>()
+        var at = 0
+        for (b in blocks) {
+            val end = b.closeLine?.plus(1) ?: lines.size
+            if (b.startLine > at) {
+                out += Segment(null, lines.subList(at, b.startLine).toList())
+            }
+            out += Segment(b, lines.subList(b.codeStart, b.codeEnd).toList())
+            at = end
+        }
+        if (at < lines.size) {
+            out += Segment(null, lines.subList(at, lines.size).toList())
+        } else if (out.isEmpty() || out.last().fence != null) {
+            out += Segment(null, emptyList())
+        }
+        return out
+    }
+
+    /** Rejoin segments exactly: fences regain their fences and language. */
+    fun buildText(segments: List<Segment>): String {
+        val lines = mutableListOf<String>()
+        for (s in segments) {
+            val f = s.fence
+            if (f == null) {
+                lines += s.lines
+            } else {
+                lines += "```" + f.lang
+                lines += s.lines
+                if (!f.unclosed) lines += "```"
+            }
+        }
+        return lines.joinToString("\n")
     }
 }
 
